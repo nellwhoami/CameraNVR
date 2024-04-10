@@ -1,209 +1,181 @@
-# 引用模块
-from bypy import ByPy     #百度网盘第三方API  开源地址：https://github.com/houtianze/bypy
-from aligo import Aligo   #阿里云盘盘第三方API  开源地址：https://github.com/foyoux/aligo
 import os
 import cv2
 import time
-import threading
+from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+from bypy import ByPy
+import numpy as np
+import requests
 
-# 配置
 
-Networkdisk = [1]  # 选择网盘 ([1] 表示百度网盘；[2] 表示阿里云网盘；[1, 2]同时选择两个网盘，)
+# 初始化ByPy
+bp = ByPy()
+
+# 设置参数
 Cameraname = 'videos'  # 摄像头名称
-videopath = '/Camera/'  # 本地文件路径
-NVRurl = '根据摄像头填写'  # 视频流URL 
-videotime = 1  # 录制视频时长（分钟，范围：1-1000）
+videopath = './Camera/'  # 本地文件路径
+NVRurl = 'rtsp://admin:password@192.168.1.22:554/stream1'  # 视频流URL
+videotime = 1  # 录制视频时长（分钟）
 Updisk = True  # 是否上传到网盘？（True 表示上传；False 表示不上传）
 deletevd = True  # 上传后是否删除视频文件？（True 表示删除；False 表示保留）
-motion_frame_interval = 3  # 背景减除帧间隔
-Networkdisk_space_threshold = 500  # 网盘剩余空间阈值（GB）
-upload_threshold = 500  # 视频上传总大小阈值（GB）
+BARK_API_URL = 'https://api.day.app/' # Bark推送的API地址
+BARK_API_KEY = ["key111","key222"]# Bark推送的KEY ,一个手机就填一个就好了
 
-# 获取文件上传的总大小
-def get_uploaded_size():
-    total_size = 0
-    for root, dirs, files in os.walk(videopath):
-        for file in files:
-            total_size += os.path.getsize(os.path.join(root, file))
-    return total_size
+# 发送Bark推送消息
+def send_bark_notification(title, body):
+    try:
+        for KEY in BARK_API_KEY:
+            response = requests.get(BARK_API_URL + KEY + '/' + title + '/' + body)
+            if response.status_code == 200:
+                print("Bark推送成功！")
+            else:
+                print("Bark推送失败:", response.text)
+    except Exception as e:
+        print("Bark推送失败:", e)
 
-def bysync(file, path, i, deletevd):
+# 上传视频到百度网盘
+def upload_to_baidu(file, path, i, deletevd):
     if i >= 3:
         print(file + " 上传错误，请检查网络、网盘账户和路径。")
         return
     time.sleep(10)
     print(file + " 正在上传到百度网盘......")
-    bp = ByPy()
     code = bp.upload(file, '/' + path + '/', ondup='overwrite')  # 使用覆盖上传方式
     if code == 0:
         if deletevd:
             os.remove(file)
         print(file + " 上传成功！")
+        send_bark_notification('警告! 检测到门口摄像头下有人经过', '视频已上传到百度网盘:  ' + file.split('/')[-1])
     else:
         i += 1
         print(file + " 重试次数: " + str(i))
-        bysync(file, path, i, deletevd)
+        upload_to_baidu(file, path, i, deletevd)
 
-def alisync(file, path, i, deletevd):
-    if i >= 3:
-        print(file + " 上传错误，请检查网络、网盘账户和路径。")
-        return
-    time.sleep(10)
-    print(file + " 正在上传到阿里云网盘......")
-    ali = Aligo()
-    code = ''
-    global floder_id
-    try:
-        code = ali.upload_files(file_paths=[file], parent_file_id=floder_id, overwrite=True)  # 使用覆盖上传方式
-    except Exception as e:
-        print(e)
-        i += 1
-        print(file + " 重试次数: " + str(i))
-        alisync(file, path, i, deletevd)
-    if code != '':
-        if deletevd:
-            os.remove(file)
-        print(file + " 上传成功！")
-    else:
-        i += 1
-        print(file + " 重试次数: " + str(i))
-        alisync(file, path, i, deletevd)
+# 使用YOLOv3进行行人检测
+def detect_pedestrians_yolo(frame, net, ln, confidence_threshold=0.5):
+    (H, W) = frame.shape[:2]
 
-def capture(NVRurl, Cameraname, videopath, videotime, Updisk, deletevd, Networkdisk, Networkdisk_space_threshold, upload_threshold):
-    try:
-        print("****")
-        cap = cv2.VideoCapture(NVRurl)
-        print("****")
-    except:
-        print("无法捕获视频流，请检查URL或网络连接。")
-        return
+    # 将帧转换为blob格式
+    blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
+    net.setInput(blob)
+    layer_outputs = net.forward(ln)
 
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    if fps >= 30:
-        fps = 30
-    elif fps <= 0:
-        fps = 15
-    print("fps: " + str(fps))
-    size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    print("视频尺寸: " + str(size))
-    videopath = os.path.join(videopath, Cameraname)
-    if not os.path.exists(videopath):
-        try:
-            os.makedirs(videopath)
-        except:
-            print("请手动创建文件夹")
-            return
+    boxes = []
+    confidences = []
+    classIDs = []
 
-    # 初始化视频上传总大小变量
-    video_total_size = 0
+    # 循环遍历每个输出层
+    for output in layer_outputs:
+        # 循环遍历每个检测
+        for detection in output:
+            scores = detection[5:]
+            classID = np.argmax(scores)
+            confidence = scores[classID]
 
-    def alisync(file, path, i, deletevd):
-        if i >= 3:
-            print(file + " 上传错误，请检查网络、网盘账户和路径。")
-            return
-        time.sleep(10)
-        print(file + " 正在上传到阿里云网盘......")
-        ali = Aligo()
-        code = ''
-        global floder_id
-        try:
-            code = ali.upload_files(file_paths=[file], parent_file_id=floder_id, overwrite=True)  # 使用覆盖上传方式
-        except Exception as e:
-            print(e)
-            i += 1
-            print(file + " 重试次数: " + str(i))
-            alisync(file, path, i, deletevd)
-        if code != '':
-            if deletevd:
-                os.remove(file)
-            print(file + " 上传成功！")
-        else:
-            i += 1
-            print(file + " 重试次数: " + str(i))
-            alisync(file, path, i, deletevd)
+            # 只保留置信度大于阈值的检测结果
+            if confidence > confidence_threshold and classID == 0:  # 0 表示行人类别
+                # 计算边界框坐标
+                box = detection[0:4] * np.array([W, H, W, H])
+                (centerX, centerY, width, height) = box.astype("int")
+                x = int(centerX - (width / 2))
+                y = int(centerY - (height / 2))
 
-    # 检测网盘空间并删除早期上传的视频文件
-    def check_and_delete_earlier_videos():
-        nonlocal video_total_size
-        if Updisk and 1 in Networkdisk and video_total_size > 0:  # 确保文件非空才进行上传判断
-            uploaded_size = get_uploaded_size() / (1024 * 1024 * 1024)  # 转换为GB单位
-            if uploaded_size > Networkdisk_space_threshold:
-                print("上传视频总大小达到 {}GB，开始检查网盘剩余空间...".format(uploaded_size))
-                bp = ByPy()
-                space_info = bp.info()
-                free_space = space_info['free'] / (1024 * 1024 * 1024)  # 转换为GB单位
-                print("网盘剩余空间为 {}GB".format(free_space))
-                if free_space < Networkdisk_space_threshold:
-                    print("网盘剩余空间不足 {}GB，开始删除早期上传的视频文件...".format(Networkdisk_space_threshold))
-                    # 删除早期上传的视频文件
-                    files_to_delete = os.listdir(videopath)
-                    files_to_delete.sort()
-                    for file in files_to_delete:
-                        file_path = os.path.join(videopath, file)
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
-                            print("已删除文件：", file)
-                    print("删除早期视频文件完成。")
-        video_total_size = 0  # 清零视频总大小，为下一轮上传准备
+                boxes.append([x, y, int(width), int(height)])
+                confidences.append(float(confidence))
+                classIDs.append(classID)
 
-    bg_subtractor = cv2.createBackgroundSubtractorKNN()
+    # 使用非最大抑制筛选最终的边界框
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, confidence_threshold, 0.3)
 
+    pedestrians = []
+    if len(indices) > 0:
+        for i in indices.flatten():
+            (x, y) = (boxes[i][0], boxes[i][1])
+            (w, h) = (boxes[i][2], boxes[i][3])
+            pedestrians.append((x, y, x + w, y + h))
+
+    return pedestrians
+
+# 视频录制函数
+def record_video_yolo(cap, net, ln, videopath, Cameraname, fps, size):
     frame_counter = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_counter += 1
-        if frame_counter % motion_frame_interval != 0:
-            continue
-
-        fg_mask = bg_subtractor.apply(frame)
-        motion_pixels = cv2.countNonZero(fg_mask)
-
-        if motion_pixels > 3000:
-            print("检测到运动，开始录制视频...")
-            cu_videopath = os.path.join(videopath, str(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())) + '.avi')
-            out = cv2.VideoWriter(cu_videopath, fourcc, fps, size)
-
-            start_time = time.time()
-
+    recording = False
+    start_recording_time = None
+    video_path = None
+    upload_tasks = []
+    print("检测是否有人经过......")
+    with ThreadPoolExecutor() as executor:
+        try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
                 frame_counter += 1
-                if frame_counter % motion_frame_interval != 0:
+                if frame_counter % 3 != 0:
                     continue
+                pedestrians = detect_pedestrians_yolo(frame, net, ln)
+                if len(pedestrians) > 0:
+                    if not recording:
+                        print("检测到行人，开始录制视频...")
+                        send_bark_notification('警告! 检测到门口摄像头下有人经过', '正在录制视频......')
+                        recording = True
+                        start_recording_time = time.time()
+                        filename = str(time.strftime("%Y年%m月%d日--%H时%M分%S秒", time.localtime()))+ '.avi'
+                        video_path = os.path.join(videopath, filename)
+                        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'XVID'), fps / 2.5, size)
 
-                fg_mask = bg_subtractor.apply(frame)
-                motion_pixels = cv2.countNonZero(fg_mask)
-
-                if motion_pixels > 3000:
+                if recording:
                     out.write(frame)
-                else:
-                    break
+                    if time.time() - start_recording_time >= videotime * 60:
+                        print("未检测到行人或录制时间到达，停止录制视频...")
+                        out.release()
+                        recording = False
+                        if Updisk:
+                            upload_task = executor.submit(upload_to_baidu, video_path, Cameraname, 0, deletevd)
+                            upload_tasks.append(upload_task)
+                            send_bark_notification('警告! 检测到门口摄像头下有人经过', '视频正在上传到百度网盘:  ' + filename)
+        finally:
+            # 显式关闭线程池，确保所有线程都已终止
+            executor.shutdown()
 
-                if time.time() - start_time >= videotime * 60:
-                    if Updisk:
-                        for disk in Networkdisk:
-                            if disk == 1:
-                                sync = threading.Thread(target=bysync, args=(cu_videopath, Cameraname, 0, deletevd))
-                            elif disk == 2:
-                                sync = threading.Thread(target=alisync, args=(cu_videopath, Cameraname, 0, deletevd))
-                            sync.start()
-                    video_total_size += os.path.getsize(cu_videopath)  # 更新视频总大小
-                    out.release()
-                    if video_total_size >= upload_threshold * (1024 * 1024 * 1024):
-                        check_and_delete_earlier_videos()  # 检测网盘空间并删除早期视频
-                    break
+    # 等待所有上传任务完成
+    wait(upload_tasks, return_when=ALL_COMPLETED)
 
-    cv2.destroyAllWindows()
     cap.release()
-    out.release()
 
 if __name__ == '__main__':
-    capture(NVRurl, Cameraname, videopath, videotime, Updisk, deletevd, Networkdisk, Networkdisk_space_threshold, upload_threshold)
+    # 加载YOLO模型和权重文件
+    weights_path = 'yolov3.weights'
+    config_path = 'yolov3.cfg'
+    names_path = 'coco.names'
+
+    print("开始加载模型...")
+    net = cv2.dnn.readNet(weights_path, config_path)
+    print("模型加载完成。")
+    unconnected_layers = net.getUnconnectedOutLayers()
+    #print("未连接输出层获取完成：", unconnected_layers)
+    #print("未连接输出层索引：", [layer - 1 for layer in unconnected_layers])
+
+    ln = net.getLayerNames()
+    ln = [ln[layer - 1] for layer in unconnected_layers]
+
+    # 从网络摄像头获取视频流
+    cap = cv2.VideoCapture(NVRurl)  # 使用 NVRurl 中指定的网络摄像头
+    if not cap.isOpened():
+        print("无法打开视频流，请检查网络摄像头连接或者 URL 设置。")
+        exit()
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if fps >= 30:
+        fps = 30
+    size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+    videopath = os.path.join(videopath, Cameraname)
+    if not os.path.exists(videopath):
+        try:
+            os.makedirs(videopath)
+        except:
+            print("请手动创建文件夹")
+            exit()
+
+    record_video_yolo(cap, net, ln, videopath, Cameraname, fps, size)
