@@ -26,7 +26,7 @@ def send_bark_notification(title, body):
         for KEY in BARK_API_KEY:
             response = requests.get(BARK_API_URL + KEY + '/' + title + '/' + body)
             if response.status_code == 200:
-                print("Bark推送成功！")
+                print("Bark推送成功: " + title + '------' + body)
             else:
                 print("Bark推送失败:", response.text)
     except Exception as e:
@@ -52,14 +52,10 @@ def upload_to_baidu(file, path, i, deletevd):
 
 # 使用YOLOv3进行行人检测
 def detect_pedestrians_yolo(frame, net, ln, confidence_threshold=0.5):
-    # 图像预处理：图像锐化
-    sharpened_frame = cv2.GaussianBlur(frame, (0, 0), 3)
-    sharpened_frame = cv2.addWeighted(frame, 1.5, sharpened_frame, -0.5, 0)
-    
     (H, W) = frame.shape[:2]
 
     # 将帧转换为blob格式
-    blob = cv2.dnn.blobFromImage(sharpened_frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
+    blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
     net.setInput(blob)
     layer_outputs = net.forward(ln)
 
@@ -99,24 +95,29 @@ def detect_pedestrians_yolo(frame, net, ln, confidence_threshold=0.5):
 
     return pedestrians
 
-
-# 在全局变量中定义一个全局的视频写入对象和上传任务列表
-global out, upload_tasks
-upload_tasks = []
-#视频录制函数
+# 视频录制函数
 def record_video_yolo(cap, net, ln, videopath, Cameraname, fps, size):
     frame_counter = 0
     recording = False
     start_recording_time = None
     video_path = None
+    upload_tasks = []
     print("检测是否有人经过......")
-    
-    try:
-        with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor() as executor:
+        try:
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                try:
+                    ret, frame = cap.read()
+                    if not ret:
+                        raise Exception("摄像头读取失败，尝试重新连接...")
+                except Exception as e:
+                    print("摄像头读取失败:", e)
+                    send_bark_notification('摄像头读取失败', '正在尝试重新连接..')
+                    # 尝试重新连接摄像头
+                    cap.release()
+                    cap = cv2.VideoCapture(NVRurl)
+                    time.sleep(10)  # 等待一段时间再尝试读取
+                    continue
 
                 frame_counter += 1
                 if frame_counter % 3 != 0:
@@ -142,17 +143,14 @@ def record_video_yolo(cap, net, ln, videopath, Cameraname, fps, size):
                             upload_task = executor.submit(upload_to_baidu, video_path, Cameraname, 0, deletevd)
                             upload_tasks.append(upload_task)
                             send_bark_notification('警告! 检测到门口摄像头下有人经过', '视频正在上传到百度网盘:  ' + filename)
-    except Exception as e:
-        print("录制视频出现异常:", e)
-        if out is not None:
-            out.release()
-        raise e
+        finally:
+            # 显式关闭线程池，确保所有线程都已终止
+            executor.shutdown()
 
     # 等待所有上传任务完成
     wait(upload_tasks, return_when=ALL_COMPLETED)
+
     cap.release()
-
-
 
 
 if __name__ == '__main__':
@@ -171,10 +169,14 @@ if __name__ == '__main__':
     ln = net.getLayerNames()
     ln = [ln[layer - 1] for layer in unconnected_layers]
 
-    # 从网络摄像头获取视频流
-    cap = cv2.VideoCapture(NVRurl)  # 使用 NVRurl 中指定的网络摄像头
-    if not cap.isOpened():
-        print("无法打开视频流，请检查网络摄像头连接或者 URL 设置。")
+    # 尝试连接网络摄像头
+    try:
+        cap = cv2.VideoCapture(NVRurl)  # 使用 NVRurl 中指定的网络摄像头
+        if not cap.isOpened():
+            raise Exception("无法打开视频流，请检查网络摄像头连接或者 URL 设置。")
+            send_bark_notification('无法打开视频流', '请检查网络摄像头连接或者 URL 设置')
+    except Exception as e:
+        print("连接摄像头异常:", e)
         exit()
 
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -191,4 +193,3 @@ if __name__ == '__main__':
             exit()
 
     record_video_yolo(cap, net, ln, videopath, Cameraname, fps, size)
-
